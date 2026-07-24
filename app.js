@@ -1141,14 +1141,14 @@ async function updateBiometricSettings() {
   button.disabled = !available;
 }
 
-async function createBiometricCredential(prfSalt = null) {
-  const extensions = { credProps: true };
-  if (prfSalt) extensions.prf = { eval: { first: prfSalt } };
-
-  const credential = await navigator.credentials.create({
+async function createBiometricCredential() {
+  const credentialPromise = navigator.credentials.create({
     publicKey: {
       challenge: randomBytes(32),
-      rp: { name: 'Entry Vault' },
+      rp: {
+        id: location.hostname,
+        name: 'Entry Vault'
+      },
       user: {
         id: randomBytes(32),
         name: `entry-vault-${Date.now()}`,
@@ -1158,30 +1158,20 @@ async function createBiometricCredential(prfSalt = null) {
         { type: 'public-key', alg: -7 },
         { type: 'public-key', alg: -257 }
       ],
-      timeout: 60000,
+      timeout: 120000,
       attestation: 'none',
       authenticatorSelection: {
-        authenticatorAttachment: 'platform',
         residentKey: 'preferred',
         requireResidentKey: false,
         userVerification: 'required'
       },
-      extensions
+      hints: ['client-device']
     }
   });
+
+  const credential = await credentialPromise;
   if (!credential) throw new Error('Credential creation was not completed');
   return credential;
-}
-
-async function createCompatibleBiometricCredential(prfSalt) {
-  try {
-    return await createBiometricCredential(prfSalt);
-  } catch (error) {
-    const retryWithoutPrf = ['NotSupportedError', 'ConstraintError', 'UnknownError', 'TypeError'].includes(error?.name);
-    if (!retryWithoutPrf) throw error;
-    console.warn('PRF credential creation failed; retrying standard WebAuthn', error);
-    return createBiometricCredential(null);
-  }
 }
 
 async function buildDeviceModeBiometricConfig({ credentialId, transports, rawVaultKey }) {
@@ -1190,11 +1180,15 @@ async function buildDeviceModeBiometricConfig({ credentialId, transports, rawVau
     false,
     ['encrypt', 'decrypt']
   );
+
   await saveBiometricWrappingKey(wrappingKey);
+  const savedWrappingKey = await getBiometricWrappingKey(BIOMETRIC_KEY_RECORD_ID);
+  if (!savedWrappingKey) throw new Error('Device wrapping key could not be stored');
+
   const wrappedKey = await encryptObject({
     marker: 'ENTRY_VAULT_BIOMETRIC_V2',
     rawKey: bytesToBase64(rawVaultKey)
-  }, wrappingKey);
+  }, savedWrappingKey);
 
   return {
     version: BIOMETRIC_VERSION,
@@ -1211,73 +1205,91 @@ async function buildDeviceModeBiometricConfig({ credentialId, transports, rawVau
 async function enableBiometricUnlock() {
   const button = $('#biometricSettingsButton');
   setBusy(button, true, '設定中…');
+  let stage = '開始';
+
   try {
     if (!state.cryptoKey) throw new Error('Vault is locked');
-    if (!(await platformAuthenticatorAvailable())) throw new Error('Platform authenticator unavailable');
+    if (!isWebAuthnAvailable()) throw new Error('WebAuthn is unavailable');
 
-    const masterPassword = prompt('生体・端末認証を安全に設定するため、マスターパスワードを入力してください。');
-    if (masterPassword === null) {
-      const canceled = new Error('Master password entry was canceled');
-      canceled.name = 'NotAllowedError';
-      throw canceled;
-    }
     const saltText = localStorage.getItem(KEY_SALT);
     if (!saltText) throw new Error('Vault salt is missing');
-    const exportableVaultKey = await deriveKey(masterPassword, base64ToBytes(saltText), true);
+
+    /*
+      WebAuthn登録はクリック直後に開始します。
+      対応状況確認、PBKDF2、promptなどを先に実行すると、Android版Chromeで
+      ユーザー操作権限が失効し、認証画面を開けないことがあります。
+    */
+    stage = '端末認証の登録';
+    const credential = await createBiometricCredential();
+
+    stage = 'マスターパスワードの確認';
+    const masterPassword = prompt('端末認証を暗号鍵に関連付けるため、マスターパスワードを入力してください。');
+    if (masterPassword === null) {
+      const canceled = new Error('Master password entry was canceled');
+      canceled.name = 'AbortError';
+      throw canceled;
+    }
+
+    const exportableVaultKey = await deriveKey(
+      masterPassword,
+      base64ToBytes(saltText),
+      true
+    );
+
     try {
       await verifyVaultKey(exportableVaultKey);
     } catch (_) {
       throw new Error('Master password is incorrect');
     }
 
-    const prfSalt = randomBytes(32);
-    const credential = await createCompatibleBiometricCredential(prfSalt);
+    stage = '暗号鍵の端末保存';
     const credentialId = bytesToBase64Url(new Uint8Array(credential.rawId));
     const transports = credential.response?.getTransports?.() || [];
     const rawVaultKey = new Uint8Array(await crypto.subtle.exportKey('raw', exportableVaultKey));
-    let config;
 
-    const registrationResult = credential.getClientExtensionResults?.()?.prf;
-    const prfResult = registrationResult?.enabled ? getPrfResult(credential) : null;
-    if (prfResult?.byteLength === 32) {
-      const wrappingKey = await importAesKey(prfResult, false);
-      prfResult.fill(0);
-      const wrappedKey = await encryptObject({
-        marker: 'ENTRY_VAULT_BIOMETRIC_V2',
-        rawKey: bytesToBase64(rawVaultKey)
-      }, wrappingKey);
-      config = {
-        version: BIOMETRIC_VERSION,
-        mode: 'prf',
-        credentialId,
-        prfSalt: bytesToBase64(prfSalt),
-        transports,
-        wrappedKey,
-        createdAt: new Date().toISOString(),
-        rpId: location.hostname
-      };
+    try {
       await deleteBiometricWrappingKey().catch(() => {});
-    } else {
-      config = await buildDeviceModeBiometricConfig({ credentialId, transports, rawVaultKey });
+      const config = await buildDeviceModeBiometricConfig({
+        credentialId,
+        transports,
+        rawVaultKey
+      });
+      localStorage.setItem(KEY_BIOMETRIC, JSON.stringify(config));
+    } finally {
+      rawVaultKey.fill(0);
     }
 
-    rawVaultKey.fill(0);
-    prfSalt.fill(0);
-    localStorage.setItem(KEY_BIOMETRIC, JSON.stringify(config));
     configureAuthScreen();
     await updateBiometricSettings();
     showToast('生体・端末認証を設定しました');
   } catch (error) {
-    console.error('Biometric setup failed', error?.name, error?.message, error);
-    const message = error?.name === 'NotAllowedError'
-      ? '認証設定がキャンセルされました'
-      : String(error?.message || '').includes('Master password')
-        ? 'マスターパスワードが正しくありません'
-        : error?.name === 'SecurityError'
-          ? 'このURLでは端末認証を登録できません'
-          : error?.name === 'InvalidStateError'
-            ? 'この端末には同じ認証情報が登録されています'
-            : '生体・端末認証の設定に失敗しました。Chromeと端末の画面ロックを確認してください';
+    console.error('Biometric setup failed', stage, error?.name, error?.message, error);
+
+    localStorage.removeItem(KEY_BIOMETRIC);
+    await deleteBiometricWrappingKey().catch(() => {});
+
+    const errorName = error?.name || 'Error';
+    const errorMessage = String(error?.message || '');
+    let message;
+
+    if (errorName === 'AbortError') {
+      message = '認証設定を中止しました';
+    } else if (errorMessage.includes('Master password')) {
+      message = 'マスターパスワードが正しくありません';
+    } else if (errorName === 'NotAllowedError') {
+      message = '端末認証が完了しませんでした。指紋・顔・端末PINを完了してから再度お試しください';
+    } else if (errorName === 'SecurityError') {
+      message = 'このURLでは端末認証を登録できません';
+    } else if (errorName === 'InvalidStateError') {
+      message = '同じ認証情報が残っています。Chromeのパスキー設定からEntry Vaultを削除して再登録してください';
+    } else if (errorName === 'NotSupportedError' || errorName === 'ConstraintError') {
+      message = 'このChromeの認証方式では登録できません。ChromeとGoogle Playシステムを更新してください';
+    } else if (errorName === 'DataCloneError' || errorMessage.includes('wrapping key')) {
+      message = '端末内への暗号鍵保存に失敗しました。Chromeを更新して再度お試しください';
+    } else {
+      message = `生体・端末認証の設定に失敗しました（${stage}・${errorName}）`;
+    }
+
     showToast(message);
   } finally {
     setBusy(button, false);
