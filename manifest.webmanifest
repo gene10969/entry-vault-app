@@ -1,0 +1,25 @@
+{
+  "name": "Entry Vault - 建物情報・暗証番号管理",
+  "short_name": "Entry Vault",
+  "description": "スクリーンショットOCRと手入力に対応した暗号化保存型の建物情報管理アプリ",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#090909",
+  "theme_color": "#090909",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
