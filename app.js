@@ -1,12 +1,14 @@
 'use strict';
 
 const DB_NAME = 'entry-vault-db';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_NAME = 'records';
+const SECURITY_STORE_NAME = 'security';
 const KEY_SALT = 'entryVault.salt';
 const KEY_VERIFIER = 'entryVault.verifier';
 const KEY_BIOMETRIC = 'entryVault.biometric';
-const BIOMETRIC_VERSION = 1;
+const BIOMETRIC_VERSION = 2;
+const BIOMETRIC_KEY_RECORD_ID = 'biometric-wrapping-key';
 const AUTO_LOCK_MS = 15 * 60 * 1000;
 const PBKDF2_ITERATIONS = 250000;
 
@@ -129,10 +131,13 @@ function hasVault() {
 function getBiometricConfig() {
   try {
     const config = JSON.parse(localStorage.getItem(KEY_BIOMETRIC) || 'null');
-    if (!config || config.version !== BIOMETRIC_VERSION || !config.credentialId || !config.prfSalt || !config.wrappedKey) {
+    if (!config || ![1, BIOMETRIC_VERSION].includes(config.version) || !config.credentialId || !config.wrappedKey) {
       return null;
     }
-    return config;
+    const mode = config.mode || (config.prfSalt ? 'prf' : 'device');
+    if (mode === 'prf' && !config.prfSalt) return null;
+    if (mode === 'device' && !config.keyRecordId) return null;
+    return { ...config, mode };
   } catch (_) {
     return null;
   }
@@ -194,11 +199,26 @@ function publicKeyCredentialDescriptor(config) {
   return descriptor;
 }
 
+async function requestStandardAssertion(config) {
+  const assertion = await navigator.credentials.get({
+    publicKey: {
+      challenge: randomBytes(32),
+      allowCredentials: [publicKeyCredentialDescriptor(config)],
+      userVerification: 'required',
+      timeout: 60000
+    }
+  });
+
+  if (!assertion) throw new Error('Authentication was not completed');
+  const returnedId = bytesToBase64Url(new Uint8Array(assertion.rawId));
+  if (returnedId !== config.credentialId) throw new Error('Credential mismatch');
+  return assertion;
+}
+
 async function requestPrfAssertion(config) {
   const assertion = await navigator.credentials.get({
     publicKey: {
       challenge: randomBytes(32),
-      rpId: location.hostname,
       allowCredentials: [publicKeyCredentialDescriptor(config)],
       userVerification: 'required',
       timeout: 60000,
@@ -220,14 +240,9 @@ async function requestPrfAssertion(config) {
   return prfResult;
 }
 
-async function unlockVaultWithBiometric() {
-  const config = getBiometricConfig();
-  if (!config) throw new Error('Biometric configuration is missing');
-  const prfResult = await requestPrfAssertion(config);
-  const wrappingKey = await importAesKey(prfResult, false);
-  prfResult.fill(0);
+async function restoreVaultKeyFromWrappedPayload(config, wrappingKey) {
   const wrapped = await decryptObject(config.wrappedKey, wrappingKey);
-  if (wrapped.marker !== 'ENTRY_VAULT_BIOMETRIC_V1' || !wrapped.rawKey) {
+  if (!['ENTRY_VAULT_BIOMETRIC_V1', 'ENTRY_VAULT_BIOMETRIC_V2'].includes(wrapped.marker) || !wrapped.rawKey) {
     throw new Error('Invalid biometric key payload');
   }
   const rawVaultKey = base64ToBytes(wrapped.rawKey);
@@ -235,6 +250,25 @@ async function unlockVaultWithBiometric() {
   rawVaultKey.fill(0);
   await verifyVaultKey(vaultKey);
   state.cryptoKey = vaultKey;
+}
+
+async function unlockVaultWithBiometric() {
+  const config = getBiometricConfig();
+  if (!config) throw new Error('Biometric configuration is missing');
+
+  if (config.mode === 'prf') {
+    const prfResult = await requestPrfAssertion(config);
+    const wrappingKey = await importAesKey(prfResult, false);
+    prfResult.fill(0);
+    await restoreVaultKeyFromWrappedPayload(config, wrappingKey);
+    return;
+  }
+
+  await requestStandardAssertion(config);
+  await ensureDatabase();
+  const wrappingKey = await getBiometricWrappingKey(config.keyRecordId);
+  if (!wrappingKey) throw new Error('Device wrapping key is missing');
+  await restoreVaultKeyFromWrappedPayload(config, wrappingKey);
 }
 
 async function deriveKey(password, saltBytes, extractable = false) {
@@ -279,6 +313,7 @@ async function createVault(password) {
   localStorage.setItem(KEY_SALT, bytesToBase64(salt));
   localStorage.setItem(KEY_VERIFIER, JSON.stringify(verifier));
   localStorage.removeItem(KEY_BIOMETRIC);
+  await deleteBiometricWrappingKey().catch(() => {});
   state.cryptoKey = key;
 }
 
@@ -298,16 +333,24 @@ function openDatabase() {
       if (!db.objectStoreNames.contains(STORE_NAME)) {
         db.createObjectStore(STORE_NAME, { keyPath: 'id' });
       }
+      if (!db.objectStoreNames.contains(SECURITY_STORE_NAME)) {
+        db.createObjectStore(SECURITY_STORE_NAME, { keyPath: 'id' });
+      }
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
 }
 
-function idbRequest(mode, action) {
+async function ensureDatabase() {
+  if (!state.db) state.db = await openDatabase();
+  return state.db;
+}
+
+function idbRequest(mode, action, storeName = STORE_NAME) {
   return new Promise((resolve, reject) => {
-    const tx = state.db.transaction(STORE_NAME, mode);
-    const store = tx.objectStore(STORE_NAME);
+    const tx = state.db.transaction(storeName, mode);
+    const store = tx.objectStore(storeName);
     const request = action(store);
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
@@ -333,6 +376,22 @@ async function getAllEnvelopes() {
 
 async function clearAllEnvelopes() {
   return idbRequest('readwrite', (store) => store.clear());
+}
+
+async function saveBiometricWrappingKey(key, id = BIOMETRIC_KEY_RECORD_ID) {
+  await ensureDatabase();
+  return idbRequest('readwrite', (store) => store.put({ id, key }), SECURITY_STORE_NAME);
+}
+
+async function getBiometricWrappingKey(id = BIOMETRIC_KEY_RECORD_ID) {
+  await ensureDatabase();
+  const record = await idbRequest('readonly', (store) => store.get(id), SECURITY_STORE_NAME);
+  return record?.key || null;
+}
+
+async function deleteBiometricWrappingKey(id = BIOMETRIC_KEY_RECORD_ID) {
+  await ensureDatabase();
+  return idbRequest('readwrite', (store) => store.delete(id), SECURITY_STORE_NAME);
 }
 
 async function loadRecords() {
@@ -430,7 +489,7 @@ async function handleAuthSubmit(event) {
 }
 
 async function enterApp() {
-  if (!state.db) state.db = await openDatabase();
+  await ensureDatabase();
   $('#authScreen').hidden = true;
   $('#appShell').hidden = false;
   resetAutoLock();
@@ -1061,7 +1120,8 @@ async function updateBiometricSettings() {
 
   const config = getBiometricConfig();
   if (config) {
-    status.textContent = `設定済み・${formatDate(config.createdAt)}`;
+    const protectionLabel = config.mode === 'prf' ? '認証情報由来の鍵で保護' : 'この端末専用の鍵で保護';
+    status.textContent = `設定済み・${protectionLabel}・${formatDate(config.createdAt)}`;
     button.textContent = '解除する';
     button.disabled = false;
     return;
@@ -1081,14 +1141,17 @@ async function updateBiometricSettings() {
   button.disabled = !available;
 }
 
-async function createBiometricCredential(prfSalt) {
+async function createBiometricCredential(prfSalt = null) {
+  const extensions = { credProps: true };
+  if (prfSalt) extensions.prf = { eval: { first: prfSalt } };
+
   const credential = await navigator.credentials.create({
     publicKey: {
       challenge: randomBytes(32),
-      rp: { name: 'Entry Vault', id: location.hostname },
+      rp: { name: 'Entry Vault' },
       user: {
         id: randomBytes(32),
-        name: 'entry-vault-local-user',
+        name: `entry-vault-${Date.now()}`,
         displayName: 'Entry Vault'
       },
       pubKeyCredParams: [
@@ -1099,18 +1162,50 @@ async function createBiometricCredential(prfSalt) {
       attestation: 'none',
       authenticatorSelection: {
         authenticatorAttachment: 'platform',
-        residentKey: 'required',
-        requireResidentKey: true,
+        residentKey: 'preferred',
+        requireResidentKey: false,
         userVerification: 'required'
       },
-      extensions: {
-        credProps: true,
-        prf: { eval: { first: prfSalt } }
-      }
+      extensions
     }
   });
   if (!credential) throw new Error('Credential creation was not completed');
   return credential;
+}
+
+async function createCompatibleBiometricCredential(prfSalt) {
+  try {
+    return await createBiometricCredential(prfSalt);
+  } catch (error) {
+    const retryWithoutPrf = ['NotSupportedError', 'ConstraintError', 'UnknownError', 'TypeError'].includes(error?.name);
+    if (!retryWithoutPrf) throw error;
+    console.warn('PRF credential creation failed; retrying standard WebAuthn', error);
+    return createBiometricCredential(null);
+  }
+}
+
+async function buildDeviceModeBiometricConfig({ credentialId, transports, rawVaultKey }) {
+  const wrappingKey = await crypto.subtle.generateKey(
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+  await saveBiometricWrappingKey(wrappingKey);
+  const wrappedKey = await encryptObject({
+    marker: 'ENTRY_VAULT_BIOMETRIC_V2',
+    rawKey: bytesToBase64(rawVaultKey)
+  }, wrappingKey);
+
+  return {
+    version: BIOMETRIC_VERSION,
+    mode: 'device',
+    credentialId,
+    transports,
+    keyRecordId: BIOMETRIC_KEY_RECORD_ID,
+    wrappedKey,
+    createdAt: new Date().toISOString(),
+    rpId: location.hostname
+  };
 }
 
 async function enableBiometricUnlock() {
@@ -1136,51 +1231,53 @@ async function enableBiometricUnlock() {
     }
 
     const prfSalt = randomBytes(32);
-    const credential = await createBiometricCredential(prfSalt);
+    const credential = await createCompatibleBiometricCredential(prfSalt);
     const credentialId = bytesToBase64Url(new Uint8Array(credential.rawId));
     const transports = credential.response?.getTransports?.() || [];
-    const registrationResult = credential.getClientExtensionResults?.()?.prf;
-    if (!registrationResult?.enabled) throw new Error('PRF is not supported by this authenticator');
-
-    let prfResult = getPrfResult(credential);
-    const provisionalConfig = {
-      credentialId,
-      prfSalt: bytesToBase64(prfSalt),
-      transports
-    };
-    if (!prfResult) prfResult = await requestPrfAssertion(provisionalConfig);
-
-    const wrappingKey = await importAesKey(prfResult, false);
-    prfResult.fill(0);
     const rawVaultKey = new Uint8Array(await crypto.subtle.exportKey('raw', exportableVaultKey));
-    const wrappedKey = await encryptObject({
-      marker: 'ENTRY_VAULT_BIOMETRIC_V1',
-      rawKey: bytesToBase64(rawVaultKey)
-    }, wrappingKey);
-    rawVaultKey.fill(0);
+    let config;
 
-    localStorage.setItem(KEY_BIOMETRIC, JSON.stringify({
-      version: BIOMETRIC_VERSION,
-      credentialId,
-      prfSalt: bytesToBase64(prfSalt),
-      transports,
-      wrappedKey,
-      createdAt: new Date().toISOString(),
-      rpId: location.hostname
-    }));
+    const registrationResult = credential.getClientExtensionResults?.()?.prf;
+    const prfResult = registrationResult?.enabled ? getPrfResult(credential) : null;
+    if (prfResult?.byteLength === 32) {
+      const wrappingKey = await importAesKey(prfResult, false);
+      prfResult.fill(0);
+      const wrappedKey = await encryptObject({
+        marker: 'ENTRY_VAULT_BIOMETRIC_V2',
+        rawKey: bytesToBase64(rawVaultKey)
+      }, wrappingKey);
+      config = {
+        version: BIOMETRIC_VERSION,
+        mode: 'prf',
+        credentialId,
+        prfSalt: bytesToBase64(prfSalt),
+        transports,
+        wrappedKey,
+        createdAt: new Date().toISOString(),
+        rpId: location.hostname
+      };
+      await deleteBiometricWrappingKey().catch(() => {});
+    } else {
+      config = await buildDeviceModeBiometricConfig({ credentialId, transports, rawVaultKey });
+    }
+
+    rawVaultKey.fill(0);
     prfSalt.fill(0);
+    localStorage.setItem(KEY_BIOMETRIC, JSON.stringify(config));
     configureAuthScreen();
     await updateBiometricSettings();
     showToast('生体・端末認証を設定しました');
   } catch (error) {
-    console.error(error);
+    console.error('Biometric setup failed', error?.name, error?.message, error);
     const message = error?.name === 'NotAllowedError'
       ? '認証設定がキャンセルされました'
       : String(error?.message || '').includes('Master password')
         ? 'マスターパスワードが正しくありません'
-        : String(error?.message || '').includes('PRF')
-          ? 'この端末の認証方式は安全な鍵復元に対応していません'
-          : '生体・端末認証の設定に失敗しました';
+        : error?.name === 'SecurityError'
+          ? 'このURLでは端末認証を登録できません'
+          : error?.name === 'InvalidStateError'
+            ? 'この端末には同じ認証情報が登録されています'
+            : '生体・端末認証の設定に失敗しました。Chromeと端末の画面ロックを確認してください';
     showToast(message);
   } finally {
     setBusy(button, false);
@@ -1190,7 +1287,9 @@ async function enableBiometricUnlock() {
 
 async function disableBiometricUnlock() {
   if (!confirm('この端末の生体・端末認証による解除を無効にしますか？')) return;
+  const config = getBiometricConfig();
   localStorage.removeItem(KEY_BIOMETRIC);
+  if (config?.keyRecordId) await deleteBiometricWrappingKey(config.keyRecordId).catch(() => {});
   configureAuthScreen();
   await updateBiometricSettings();
   showToast('生体・端末認証を解除しました');
@@ -1259,6 +1358,7 @@ async function importBackup(file) {
     localStorage.setItem(KEY_SALT, backup.salt);
     localStorage.setItem(KEY_VERIFIER, JSON.stringify(backup.verifier));
     localStorage.removeItem(KEY_BIOMETRIC);
+    await deleteBiometricWrappingKey().catch(() => {});
     showToast('復元しました。元のパスワードで再解除してください');
     setTimeout(lockApp, 500);
   } catch (error) {
