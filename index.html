@@ -23,6 +23,12 @@
       <h1>Entry Vault</h1>
       <p id="authDescription" class="auth-description"></p>
 
+      <div id="biometricUnlockWrap" class="biometric-unlock-wrap" hidden>
+        <button id="biometricUnlockButton" class="primary-button biometric-button" type="button">◎ 生体・端末認証で解除</button>
+        <p class="micro-note">指紋・顔・Windows Hello・端末PINなど、端末が提示する方法で本人確認します。</p>
+        <div class="auth-divider" aria-hidden="true"><span>または</span></div>
+      </div>
+
       <form id="authForm" class="stack-form" autocomplete="off">
         <label>
           <span>マスターパスワード</span>
@@ -185,6 +191,13 @@
           </div>
           <div class="setting-row">
             <div>
+              <h3>生体・端末認証</h3>
+              <p id="biometricStatus">対応状況を確認中です。</p>
+            </div>
+            <button id="biometricSettingsButton" class="ghost-button" type="button">設定する</button>
+          </div>
+          <div class="setting-row">
+            <div>
               <h3>暗号化バックアップ</h3>
               <p>機種変更やブラウザデータ消去に備えて保存します。</p>
             </div>
@@ -220,7 +233,9 @@
           <h3>セキュリティ仕様</h3>
           <ul>
             <li>保存データはAES-GCMで暗号化</li>
-            <li>暗号鍵はマスターパスワードから生成し、保存しない</li>
+            <li>暗号鍵はマスターパスワードから生成し、平文では保存しない</li>
+            <li>対応端末ではWebAuthn PRFを使い、生体・端末認証で暗号鍵を安全に復元</li>
+            <li>生体・端末認証が使えない場合はマスターパスワードで復旧</li>
             <li>15分間操作がない場合は自動ロック</li>
             <li>OCR処理はブラウザ内で実行し、スクショを外部サーバーへ送信しない</li>
           </ul>

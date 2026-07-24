@@ -5,6 +5,8 @@ const DB_VERSION = 1;
 const STORE_NAME = 'records';
 const KEY_SALT = 'entryVault.salt';
 const KEY_VERIFIER = 'entryVault.verifier';
+const KEY_BIOMETRIC = 'entryVault.biometric';
+const BIOMETRIC_VERSION = 1;
 const AUTO_LOCK_MS = 15 * 60 * 1000;
 const PBKDF2_ITERATIONS = 250000;
 
@@ -18,7 +20,9 @@ const state = {
   dialogId: '',
   lockTimer: null,
   deferredInstallPrompt: null,
-  toastTimer: null
+  toastTimer: null,
+  biometricUnlockInProgress: false,
+  autoBiometricAttempted: false
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -40,6 +44,37 @@ function base64ToBytes(base64) {
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
   return bytes;
+}
+
+function bytesToBase64Url(bytes) {
+  return bytesToBase64(bytes)
+    .replaceAll('+', '-')
+    .replaceAll('/', '_')
+    .replace(/=+$/g, '');
+}
+
+function base64UrlToBytes(base64Url) {
+  const normalized = String(base64Url).replaceAll('-', '+').replaceAll('_', '/');
+  const padding = '='.repeat((4 - (normalized.length % 4)) % 4);
+  return base64ToBytes(normalized + padding);
+}
+
+function toUint8Array(value) {
+  if (value instanceof Uint8Array) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength));
+  }
+  if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
+  if (value && typeof value.byteLength === 'number') {
+    const source = value.buffer || value;
+    const offset = Number(value.byteOffset || 0);
+    return new Uint8Array(source.slice(offset, offset + value.byteLength));
+  }
+  throw new TypeError('Expected an ArrayBuffer or TypedArray');
+}
+
+function randomBytes(length = 32) {
+  return crypto.getRandomValues(new Uint8Array(length));
 }
 
 function escapeHtml(value = '') {
@@ -91,7 +126,118 @@ function hasVault() {
   return Boolean(localStorage.getItem(KEY_SALT) && localStorage.getItem(KEY_VERIFIER));
 }
 
-async function deriveKey(password, saltBytes) {
+function getBiometricConfig() {
+  try {
+    const config = JSON.parse(localStorage.getItem(KEY_BIOMETRIC) || 'null');
+    if (!config || config.version !== BIOMETRIC_VERSION || !config.credentialId || !config.prfSalt || !config.wrappedKey) {
+      return null;
+    }
+    return config;
+  } catch (_) {
+    return null;
+  }
+}
+
+function hasBiometricUnlock() {
+  return Boolean(hasVault() && getBiometricConfig());
+}
+
+function isWebAuthnAvailable() {
+  return Boolean(
+    window.isSecureContext &&
+    window.PublicKeyCredential &&
+    navigator.credentials?.create &&
+    navigator.credentials?.get
+  );
+}
+
+async function platformAuthenticatorAvailable() {
+  if (!isWebAuthnAvailable()) return false;
+  if (typeof PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable !== 'function') return true;
+  try {
+    return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+  } catch (_) {
+    return false;
+  }
+}
+
+async function importAesKey(rawBytes, extractable = false) {
+  return crypto.subtle.importKey(
+    'raw',
+    rawBytes,
+    { name: 'AES-GCM', length: 256 },
+    extractable,
+    ['encrypt', 'decrypt']
+  );
+}
+
+async function verifyVaultKey(key) {
+  const verifierText = localStorage.getItem(KEY_VERIFIER);
+  if (!verifierText) throw new Error('Vault verifier is missing');
+  const result = await decryptObject(JSON.parse(verifierText), key);
+  if (result.marker !== 'ENTRY_VAULT_V1') throw new Error('Invalid verifier');
+}
+
+function getPrfResult(credential) {
+  const value = credential?.getClientExtensionResults?.()?.prf?.results?.first;
+  return value ? toUint8Array(value) : null;
+}
+
+function publicKeyCredentialDescriptor(config) {
+  const descriptor = {
+    type: 'public-key',
+    id: base64UrlToBytes(config.credentialId)
+  };
+  if (Array.isArray(config.transports) && config.transports.length) {
+    descriptor.transports = config.transports;
+  }
+  return descriptor;
+}
+
+async function requestPrfAssertion(config) {
+  const assertion = await navigator.credentials.get({
+    publicKey: {
+      challenge: randomBytes(32),
+      rpId: location.hostname,
+      allowCredentials: [publicKeyCredentialDescriptor(config)],
+      userVerification: 'required',
+      timeout: 60000,
+      extensions: {
+        prf: {
+          evalByCredential: {
+            [config.credentialId]: { first: base64ToBytes(config.prfSalt) }
+          }
+        }
+      }
+    }
+  });
+
+  if (!assertion) throw new Error('Authentication was not completed');
+  const returnedId = bytesToBase64Url(new Uint8Array(assertion.rawId));
+  if (returnedId !== config.credentialId) throw new Error('Credential mismatch');
+  const prfResult = getPrfResult(assertion);
+  if (!prfResult || prfResult.byteLength !== 32) throw new Error('PRF result is unavailable');
+  return prfResult;
+}
+
+async function unlockVaultWithBiometric() {
+  const config = getBiometricConfig();
+  if (!config) throw new Error('Biometric configuration is missing');
+  const prfResult = await requestPrfAssertion(config);
+  const wrappingKey = await importAesKey(prfResult, false);
+  prfResult.fill(0);
+  const wrapped = await decryptObject(config.wrappedKey, wrappingKey);
+  if (wrapped.marker !== 'ENTRY_VAULT_BIOMETRIC_V1' || !wrapped.rawKey) {
+    throw new Error('Invalid biometric key payload');
+  }
+  const rawVaultKey = base64ToBytes(wrapped.rawKey);
+  const vaultKey = await importAesKey(rawVaultKey, false);
+  rawVaultKey.fill(0);
+  await verifyVaultKey(vaultKey);
+  state.cryptoKey = vaultKey;
+}
+
+async function deriveKey(password, saltBytes, extractable = false) {
   const keyMaterial = await crypto.subtle.importKey(
     'raw', encoder.encode(password), 'PBKDF2', false, ['deriveKey']
   );
@@ -104,7 +250,7 @@ async function deriveKey(password, saltBytes) {
     },
     keyMaterial,
     { name: 'AES-GCM', length: 256 },
-    false,
+    extractable,
     ['encrypt', 'decrypt']
   );
 }
@@ -132,15 +278,15 @@ async function createVault(password) {
   const verifier = await encryptObject({ marker: 'ENTRY_VAULT_V1' }, key);
   localStorage.setItem(KEY_SALT, bytesToBase64(salt));
   localStorage.setItem(KEY_VERIFIER, JSON.stringify(verifier));
+  localStorage.removeItem(KEY_BIOMETRIC);
   state.cryptoKey = key;
 }
 
 async function unlockVault(password) {
-  const salt = base64ToBytes(localStorage.getItem(KEY_SALT));
-  const key = await deriveKey(password, salt);
-  const verifier = JSON.parse(localStorage.getItem(KEY_VERIFIER));
-  const result = await decryptObject(verifier, key);
-  if (result.marker !== 'ENTRY_VAULT_V1') throw new Error('Invalid verifier');
+  const saltText = localStorage.getItem(KEY_SALT);
+  if (!saltText) throw new Error('Vault salt is missing');
+  const key = await deriveKey(password, base64ToBytes(saltText));
+  await verifyVaultKey(key);
   state.cryptoKey = key;
 }
 
@@ -207,12 +353,48 @@ async function loadRecords() {
 
 function configureAuthScreen() {
   const setup = !hasVault();
+  const biometricReady = !setup && hasBiometricUnlock() && isWebAuthnAvailable();
   $('#confirmPasswordWrap').hidden = !setup;
   $('#confirmPassword').required = setup;
-  $('#authSubmit').textContent = setup ? '保管庫を作成' : 'ロックを解除';
+  $('#biometricUnlockWrap').hidden = !biometricReady;
+  $('#authForm').classList.toggle('auth-form-biometric', biometricReady);
+  $('#authSubmit').textContent = setup ? '保管庫を作成' : 'マスターパスワードで解除';
   $('#authDescription').textContent = setup
     ? '最初に、保存情報を暗号化するためのマスターパスワードを設定します。'
-    : 'マスターパスワードを入力して、保存情報を復号します。';
+    : biometricReady
+      ? '生体・端末認証、またはマスターパスワードで保存情報を復号します。'
+      : 'マスターパスワードを入力して、保存情報を復号します。';
+}
+
+async function handleBiometricUnlock({ automatic = false } = {}) {
+  if (state.biometricUnlockInProgress || !hasBiometricUnlock()) return;
+  const button = $('#biometricUnlockButton');
+  const error = $('#authError');
+  state.biometricUnlockInProgress = true;
+  error.textContent = '';
+  setBusy(button, true, '本人確認中…');
+  try {
+    await unlockVaultWithBiometric();
+    await enterApp();
+    $('#masterPassword').value = '';
+    showToast('生体・端末認証で解除しました');
+  } catch (biometricError) {
+    console.error(biometricError);
+    if (!(automatic && biometricError?.name === 'NotAllowedError')) {
+      error.textContent = biometricError?.name === 'NotAllowedError'
+        ? '認証がキャンセルされました。もう一度お試しください。'
+        : '生体・端末認証を利用できません。マスターパスワードで解除してください。';
+    }
+  } finally {
+    state.biometricUnlockInProgress = false;
+    setBusy(button, false);
+  }
+}
+
+function maybeAutoBiometricUnlock() {
+  if (state.autoBiometricAttempted || document.visibilityState !== 'visible' || !hasBiometricUnlock()) return;
+  state.autoBiometricAttempted = true;
+  setTimeout(() => handleBiometricUnlock({ automatic: true }), 350);
 }
 
 async function handleAuthSubmit(event) {
@@ -253,6 +435,7 @@ async function enterApp() {
   $('#appShell').hidden = false;
   resetAutoLock();
   await loadRecords();
+  await updateBiometricSettings();
 }
 
 function lockApp() {
@@ -265,6 +448,7 @@ function lockApp() {
   $('#appShell').hidden = true;
   $('#authScreen').hidden = false;
   configureAuthScreen();
+  $('#authError').textContent = '';
   $('#masterPassword').focus();
 }
 
@@ -281,7 +465,10 @@ function switchView(viewId) {
   $$('.view').forEach((view) => view.classList.toggle('active', view.id === viewId));
   $$('.nav-button').forEach((button) => button.classList.toggle('active', button.dataset.view === viewId));
   if (viewId === 'searchView') renderSearchResults();
-  if (viewId === 'settingsView') updateStorageSummary();
+  if (viewId === 'settingsView') {
+    updateStorageSummary();
+    updateBiometricSettings();
+  }
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
@@ -867,6 +1054,153 @@ function toggleDialogPin() {
   button.textContent = shown ? '表示' : '隠す';
 }
 
+async function updateBiometricSettings() {
+  const status = $('#biometricStatus');
+  const button = $('#biometricSettingsButton');
+  if (!status || !button) return;
+
+  const config = getBiometricConfig();
+  if (config) {
+    status.textContent = `設定済み・${formatDate(config.createdAt)}`;
+    button.textContent = '解除する';
+    button.disabled = false;
+    return;
+  }
+
+  button.textContent = '設定する';
+  if (!isWebAuthnAvailable()) {
+    status.textContent = 'この環境では利用できません。HTTPSと対応ブラウザが必要です。';
+    button.disabled = true;
+    return;
+  }
+
+  const available = await platformAuthenticatorAvailable();
+  status.textContent = available
+    ? '指紋・顔・Windows Hello・端末PINなどで解除できます。'
+    : 'この端末では生体・端末認証を確認できませんでした。';
+  button.disabled = !available;
+}
+
+async function createBiometricCredential(prfSalt) {
+  const credential = await navigator.credentials.create({
+    publicKey: {
+      challenge: randomBytes(32),
+      rp: { name: 'Entry Vault', id: location.hostname },
+      user: {
+        id: randomBytes(32),
+        name: 'entry-vault-local-user',
+        displayName: 'Entry Vault'
+      },
+      pubKeyCredParams: [
+        { type: 'public-key', alg: -7 },
+        { type: 'public-key', alg: -257 }
+      ],
+      timeout: 60000,
+      attestation: 'none',
+      authenticatorSelection: {
+        authenticatorAttachment: 'platform',
+        residentKey: 'required',
+        requireResidentKey: true,
+        userVerification: 'required'
+      },
+      extensions: {
+        credProps: true,
+        prf: { eval: { first: prfSalt } }
+      }
+    }
+  });
+  if (!credential) throw new Error('Credential creation was not completed');
+  return credential;
+}
+
+async function enableBiometricUnlock() {
+  const button = $('#biometricSettingsButton');
+  setBusy(button, true, '設定中…');
+  try {
+    if (!state.cryptoKey) throw new Error('Vault is locked');
+    if (!(await platformAuthenticatorAvailable())) throw new Error('Platform authenticator unavailable');
+
+    const masterPassword = prompt('生体・端末認証を安全に設定するため、マスターパスワードを入力してください。');
+    if (masterPassword === null) {
+      const canceled = new Error('Master password entry was canceled');
+      canceled.name = 'NotAllowedError';
+      throw canceled;
+    }
+    const saltText = localStorage.getItem(KEY_SALT);
+    if (!saltText) throw new Error('Vault salt is missing');
+    const exportableVaultKey = await deriveKey(masterPassword, base64ToBytes(saltText), true);
+    try {
+      await verifyVaultKey(exportableVaultKey);
+    } catch (_) {
+      throw new Error('Master password is incorrect');
+    }
+
+    const prfSalt = randomBytes(32);
+    const credential = await createBiometricCredential(prfSalt);
+    const credentialId = bytesToBase64Url(new Uint8Array(credential.rawId));
+    const transports = credential.response?.getTransports?.() || [];
+    const registrationResult = credential.getClientExtensionResults?.()?.prf;
+    if (!registrationResult?.enabled) throw new Error('PRF is not supported by this authenticator');
+
+    let prfResult = getPrfResult(credential);
+    const provisionalConfig = {
+      credentialId,
+      prfSalt: bytesToBase64(prfSalt),
+      transports
+    };
+    if (!prfResult) prfResult = await requestPrfAssertion(provisionalConfig);
+
+    const wrappingKey = await importAesKey(prfResult, false);
+    prfResult.fill(0);
+    const rawVaultKey = new Uint8Array(await crypto.subtle.exportKey('raw', exportableVaultKey));
+    const wrappedKey = await encryptObject({
+      marker: 'ENTRY_VAULT_BIOMETRIC_V1',
+      rawKey: bytesToBase64(rawVaultKey)
+    }, wrappingKey);
+    rawVaultKey.fill(0);
+
+    localStorage.setItem(KEY_BIOMETRIC, JSON.stringify({
+      version: BIOMETRIC_VERSION,
+      credentialId,
+      prfSalt: bytesToBase64(prfSalt),
+      transports,
+      wrappedKey,
+      createdAt: new Date().toISOString(),
+      rpId: location.hostname
+    }));
+    prfSalt.fill(0);
+    configureAuthScreen();
+    await updateBiometricSettings();
+    showToast('生体・端末認証を設定しました');
+  } catch (error) {
+    console.error(error);
+    const message = error?.name === 'NotAllowedError'
+      ? '認証設定がキャンセルされました'
+      : String(error?.message || '').includes('Master password')
+        ? 'マスターパスワードが正しくありません'
+        : String(error?.message || '').includes('PRF')
+          ? 'この端末の認証方式は安全な鍵復元に対応していません'
+          : '生体・端末認証の設定に失敗しました';
+    showToast(message);
+  } finally {
+    setBusy(button, false);
+    await updateBiometricSettings();
+  }
+}
+
+async function disableBiometricUnlock() {
+  if (!confirm('この端末の生体・端末認証による解除を無効にしますか？')) return;
+  localStorage.removeItem(KEY_BIOMETRIC);
+  configureAuthScreen();
+  await updateBiometricSettings();
+  showToast('生体・端末認証を解除しました');
+}
+
+async function toggleBiometricSetting() {
+  if (getBiometricConfig()) await disableBiometricUnlock();
+  else await enableBiometricUnlock();
+}
+
 async function updateStorageSummary() {
   const summary = $('#storageSummary');
   if (!summary) return;
@@ -924,6 +1258,7 @@ async function importBackup(file) {
     }
     localStorage.setItem(KEY_SALT, backup.salt);
     localStorage.setItem(KEY_VERIFIER, JSON.stringify(backup.verifier));
+    localStorage.removeItem(KEY_BIOMETRIC);
     showToast('復元しました。元のパスワードで再解除してください');
     setTimeout(lockApp, 500);
   } catch (error) {
@@ -968,6 +1303,7 @@ function registerServiceWorker() {
 
 function bindEvents() {
   $('#authForm').addEventListener('submit', handleAuthSubmit);
+  $('#biometricUnlockButton').addEventListener('click', () => handleBiometricUnlock());
   $('#quickLockButton').addEventListener('click', lockApp);
   $('#recordForm').addEventListener('submit', handleRecordSave);
   $('#resetFormButton').addEventListener('click', resetForm);
@@ -1007,6 +1343,7 @@ function bindEvents() {
   $('#dialogDeleteButton').addEventListener('click', () => deleteRecord(state.dialogId));
 
   $('#refreshStorageButton').addEventListener('click', updateStorageSummary);
+  $('#biometricSettingsButton').addEventListener('click', toggleBiometricSetting);
   $('#exportButton').addEventListener('click', exportBackup);
   $('#importInput').addEventListener('change', (event) => importBackup(event.target.files[0]));
   $('#deleteAllButton').addEventListener('click', deleteAllData);
@@ -1030,6 +1367,7 @@ async function init() {
   if (!window.isSecureContext) {
     console.warn('Web Crypto/PWA features require HTTPS or localhost.');
   }
+  maybeAutoBiometricUnlock();
 }
 
 document.addEventListener('DOMContentLoaded', init);

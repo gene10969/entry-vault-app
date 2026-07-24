@@ -153,6 +153,14 @@ button:disabled { opacity: .38; cursor: not-allowed; }
 .form-error { min-height: 22px; margin: 10px 0 0; color: var(--danger); font-size: 13px; }
 .micro-note { margin: 12px 0 0; color: var(--muted); font-size: 12px; line-height: 1.65; }
 
+.biometric-unlock-wrap { margin: 18px 0 4px; }
+.biometric-button { display: flex; align-items: center; justify-content: center; gap: 10px; }
+.biometric-icon { font-size: 22px; line-height: 1; }
+.auth-divider { display: flex; align-items: center; gap: 12px; margin: 18px 0 15px; color: #716b60; font-size: 11px; }
+.auth-divider::before, .auth-divider::after { content: ""; flex: 1; height: 1px; background: rgba(215,181,109,.14); }
+.auth-form-biometric #authSubmit { border-color: rgba(215,181,109,.34); color: var(--gold-bright); background: rgba(215,181,109,.06); box-shadow: none; }
+.auth-form-biometric #authSubmit:hover { background: rgba(215,181,109,.11); }
+
 .app-shell { position: relative; z-index: 1; min-height: 100vh; padding-bottom: calc(92px + var(--safe-bottom)); }
 .topbar {
   position: sticky;
