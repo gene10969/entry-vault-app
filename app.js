@@ -332,6 +332,150 @@ async function prepareOcrImage(dataUrl) {
   return canvas.toDataURL('image/jpeg', 0.92);
 }
 
+function pixelLuminance(data, offset) {
+  return 0.299 * data[offset] + 0.587 * data[offset + 1] + 0.114 * data[offset + 2];
+}
+
+function sampledMedian(values) {
+  if (!values.length) return 128;
+  values.sort((a, b) => a - b);
+  return values[Math.floor(values.length / 2)];
+}
+
+function findDeliveryNameCrop(sourceCanvas) {
+  const { width, height } = sourceCanvas;
+  const ctx = sourceCanvas.getContext('2d', { willReadFrequently: true });
+  const pixels = ctx.getImageData(0, 0, width, height).data;
+  const luminanceAt = (x, y) => pixelLuminance(pixels, (y * width + x) * 4);
+
+  const dividerLeft = Math.round(width * 0.02);
+  const dividerRight = Math.round(width * 0.98);
+  const dividerTop = Math.round(height * 0.08);
+  const dividerBottom = Math.round(height * 0.25);
+  const backgroundSamples = [];
+
+  for (let y = dividerTop; y < dividerBottom; y += 8) {
+    for (let x = dividerLeft; x < dividerRight; x += 12) {
+      backgroundSamples.push(luminanceAt(x, y));
+    }
+  }
+
+  const background = sampledMedian(backgroundSamples);
+  const darkMode = background < 128;
+  let dividerY = Math.round(height * 0.163);
+  let foundDivider = false;
+
+  for (let y = dividerTop; y < dividerBottom; y += 1) {
+    let dividerPixels = 0;
+    let samples = 0;
+    for (let x = dividerLeft; x < dividerRight; x += 4) {
+      const value = luminanceAt(x, y);
+      const isDivider = darkMode
+        ? value > background + 6 && value < 120
+        : value < background - 6 && value > 135;
+      if (isDivider) dividerPixels += 1;
+      samples += 1;
+    }
+    if (samples && dividerPixels / samples > 0.72) {
+      dividerY = y;
+      foundDivider = true;
+    }
+  }
+
+  if (!foundDivider) dividerY = Math.round(height * 0.163);
+
+  const textLeft = Math.round(width * 0.02);
+  const textRight = Math.round(width * 0.70);
+  const scanTop = Math.min(height - 1, dividerY + 5);
+  const scanBottom = Math.min(height, dividerY + Math.round(height * 0.18));
+  const textBackgroundSamples = [];
+
+  for (let y = scanTop; y < scanBottom; y += 8) {
+    for (let x = textLeft; x < textRight; x += 12) {
+      textBackgroundSamples.push(luminanceAt(x, y));
+    }
+  }
+
+  const textBackground = sampledMedian(textBackgroundSamples);
+  const textRows = [];
+  for (let y = scanTop; y < scanBottom; y += 1) {
+    let textPixels = 0;
+    let samples = 0;
+    for (let x = textLeft; x < textRight; x += 2) {
+      const value = luminanceAt(x, y);
+      const isText = darkMode
+        ? value > Math.max(120, textBackground + 55)
+        : value < Math.min(135, textBackground - 55);
+      if (isText) textPixels += 1;
+      samples += 1;
+    }
+    textRows.push({ y, active: samples && textPixels / samples > 0.008 });
+  }
+
+  const groups = [];
+  let start = null;
+  let lastActive = null;
+  for (const row of textRows) {
+    if (row.active) {
+      if (start === null) start = row.y;
+      lastActive = row.y;
+    } else if (start !== null && row.y - lastActive > 3) {
+      groups.push({ start, end: lastActive });
+      start = null;
+      lastActive = null;
+    }
+  }
+  if (start !== null) groups.push({ start, end: lastActive });
+
+  const minimumNameHeight = Math.max(12, Math.round(height * 0.014));
+  const nameGroup = groups.find((group) => group.end - group.start + 1 >= minimumNameHeight);
+  const fallbackTop = dividerY + Math.round(height * 0.012);
+  const fallbackBottom = dividerY + Math.round(height * 0.075);
+  const top = Math.max(0, (nameGroup?.start ?? fallbackTop) - Math.round(height * 0.005));
+  const bottom = Math.min(height, (nameGroup?.end ?? fallbackBottom) + Math.round(height * 0.005));
+
+  return {
+    left: textLeft,
+    top,
+    width: Math.max(1, textRight - textLeft),
+    height: Math.max(1, bottom - top),
+    darkMode
+  };
+}
+
+async function prepareDeliveryNameOcrImage(dataUrl) {
+  const image = await loadImage(dataUrl);
+  const sourceCanvas = document.createElement('canvas');
+  sourceCanvas.width = image.naturalWidth;
+  sourceCanvas.height = image.naturalHeight;
+  const sourceCtx = sourceCanvas.getContext('2d', { willReadFrequently: true });
+  sourceCtx.drawImage(image, 0, 0);
+
+  const crop = findDeliveryNameCrop(sourceCanvas);
+  const targetHeight = 260;
+  const scale = Math.min(4, Math.max(2, targetHeight / crop.height));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(crop.width * scale));
+  canvas.height = Math.max(1, Math.round(crop.height * scale));
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(
+    sourceCanvas,
+    crop.left, crop.top, crop.width, crop.height,
+    0, 0, canvas.width, canvas.height
+  );
+
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imageData.data;
+  for (let i = 0; i < data.length; i += 4) {
+    let gray = pixelLuminance(data, i);
+    if (crop.darkMode) gray = 255 - gray;
+    const contrasted = Math.max(0, Math.min(255, (gray - 128) * 1.42 + 128));
+    data[i] = data[i + 1] = data[i + 2] = contrasted;
+  }
+  ctx.putImageData(imageData, 0, 0);
+  return canvas.toDataURL('image/png');
+}
+
 async function handleScreenshot(file) {
   if (!file) return;
   if (!file.type.startsWith('image/')) {
@@ -386,6 +530,32 @@ function valueAfterLabel(lines, labels) {
     }
   }
   return '';
+}
+
+function extractDeliveryName(rawText) {
+  const lines = rawText
+    .normalize('NFKC')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map(cleanOcrLine)
+    .map((line) => line
+      .replace(/^[=~_<>「」『』【】［］\[\]()（）]+|[=~_<>「」『』【】［］\[\]()（）]+$/g, '')
+      .replace(/\s*([.．・･])\s*/g, '$1')
+      .trim())
+    .filter(Boolean);
+
+  const ignored = /(読み込んで|配達|向かっています|住所|日本|〒|電話|建物|部屋|暗証|注文|受け渡し|マンション|アパート|ハイツ|ビル|号室|お客様|メモ|tel|phone)/i;
+  const candidates = lines.filter((line) => {
+    if (ignored.test(line) || /\d{2,}/.test(line)) return false;
+    if (line.length < 1 || line.length > 28) return false;
+    return /^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}A-Za-z.．・･ー―‐\s-]+$/u.test(line);
+  });
+
+  const name = candidates[0] || '';
+  return name
+    .replace(/(?:様|さま)$/u, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function parseOcrText(rawText) {
@@ -451,31 +621,55 @@ async function runOcr() {
   progressText.textContent = '画像を最適化しています';
 
   let worker;
+  let ocrPhase = 'full';
   try {
-    const preparedImage = await prepareOcrImage(state.imageData);
+    const [preparedImage, preparedNameImage] = await Promise.all([
+      prepareOcrImage(state.imageData),
+      prepareDeliveryNameOcrImage(state.imageData)
+    ]);
     worker = await Tesseract.createWorker(['jpn', 'eng'], 1, {
       logger(message) {
         const progress = Math.round((message.progress || 0) * 100);
         progressBar.style.width = `${Math.max(2, progress)}%`;
+        const recognizingText = ocrPhase === 'name'
+          ? `上部の太字名を読み取っています ${progress}%`
+          : `建物名・部屋番号を読み取っています ${progress}%`;
         const statusMap = {
           'loading tesseract core': 'OCRエンジンを準備しています',
           'initializing tesseract': 'OCRを初期化しています',
           'loading language traineddata': '日本語データを読み込んでいます',
           'initializing api': '文字認識を準備しています',
-          'recognizing text': `文字を読み取っています ${progress}%`
+          'recognizing text': recognizingText
         };
-        progressText.textContent = statusMap[message.status] || '文字を読み取っています';
+        progressText.textContent = statusMap[message.status] || recognizingText;
       }
     });
     await worker.setParameters({ preserve_interword_spaces: '1', user_defined_dpi: '300' });
     const result = await worker.recognize(preparedImage);
     const parsed = parseOcrText(result.data.text || '');
-    state.ocrText = parsed.rawText;
+
+    ocrPhase = 'name';
+    progressBar.style.width = '2%';
+    progressText.textContent = '上部の太字名を切り出して読み取っています';
+    await worker.reinitialize('jpn', 1);
+    await worker.setParameters({
+      preserve_interword_spaces: '1',
+      user_defined_dpi: '300',
+      tessedit_pageseg_mode: Tesseract.PSM.SINGLE_BLOCK
+    });
+    const nameResult = await worker.recognize(preparedNameImage);
+    const deliveryName = extractDeliveryName(nameResult.data.text || '');
+    if (deliveryName) parsed.name = deliveryName;
+
+    state.ocrText = [
+      parsed.rawText,
+      deliveryName ? `上部の太字名: ${deliveryName}` : ''
+    ].filter(Boolean).join('\n');
 
     if (parsed.name) $('#nameInput').value = parsed.name;
     if (parsed.building) $('#buildingInput').value = parsed.building;
     if (parsed.room) $('#roomInput').value = parsed.room;
-    $('#ocrRawText').value = parsed.rawText;
+    $('#ocrRawText').value = state.ocrText;
     $('#ocrDetails').hidden = false;
     progressBar.style.width = '100%';
     progressText.textContent = '読み取り完了';
