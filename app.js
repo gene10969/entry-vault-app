@@ -1161,11 +1161,11 @@ async function createBiometricCredential() {
       timeout: 120000,
       attestation: 'none',
       authenticatorSelection: {
-        residentKey: 'preferred',
+        authenticatorAttachment: 'platform',
+        residentKey: 'discouraged',
         requireResidentKey: false,
         userVerification: 'required'
-      },
-      hints: ['client-device']
+      }
     }
   });
 
