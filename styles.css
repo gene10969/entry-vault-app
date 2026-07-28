@@ -106,6 +106,16 @@ input:focus, textarea:focus {
 textarea { resize: vertical; line-height: 1.6; }
 .password-row { display: flex; gap: 8px; align-items: stretch; }
 .password-row input { flex: 1; min-width: 0; }
+.pin-input-row .input-mode-button { min-width: 78px; }
+.masked-text-input {
+  -webkit-text-security: disc;
+  text-security: disc;
+}
+.masked-text-input.secret-visible {
+  -webkit-text-security: none;
+  text-security: none;
+}
+.input-help { display: block; margin-top: 7px; color: var(--muted); font-size: 11px; line-height: 1.55; }
 .icon-button, .text-button, .danger-text-button {
   border: 0;
   background: transparent;

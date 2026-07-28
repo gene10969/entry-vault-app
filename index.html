@@ -74,7 +74,7 @@
           <div class="panel-title-row">
             <div>
               <h3>スクショから自動入力</h3>
-              <p>名前・建物名・部屋番号をOCRで抽出します。</p>
+              <p>画像を選ぶと、名前・建物名・部屋番号を自動で読み取ります。</p>
             </div>
             <span class="status-chip">暗証番号は手入力</span>
           </div>
@@ -91,7 +91,7 @@
             <button id="removeImageButton" class="danger-text-button" type="button">画像を外す</button>
           </div>
 
-          <button id="ocrButton" class="secondary-button" type="button" disabled>文字を読み取り、自動入力</button>
+          <button id="ocrButton" class="secondary-button" type="button" disabled>もう一度読み取る</button>
           <div id="ocrProgressWrap" class="progress-wrap" hidden>
             <div class="progress-track"><span id="ocrProgressBar"></span></div>
             <p id="ocrProgressText">OCR準備中</p>
@@ -127,10 +127,12 @@
             </label>
             <label>
               <span>暗証番号</span>
-              <div class="password-row">
-                <input id="pinInput" type="password" inputmode="text" placeholder="例：1234、呼出123" autocomplete="off">
-                <button class="icon-button" type="button" data-toggle-password="pinInput">表示</button>
+              <div class="password-row pin-input-row">
+                <input id="pinInput" class="masked-text-input" type="password" inputmode="numeric" lang="ja" placeholder="例：1234、呼出123" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="done" aria-describedby="pinInputHelp">
+                <button id="pinInputModeButton" class="icon-button input-mode-button" type="button" aria-pressed="false" aria-label="かな入力に切り替える">かな入力</button>
+                <button id="pinVisibilityButton" class="icon-button" type="button" aria-pressed="false" aria-label="暗証番号を表示">表示</button>
               </div>
+              <small id="pinInputHelp" class="input-help">最初は数字入力です。文字を入力する場合は「かな入力」に切り替えてください。</small>
             </label>
             <label class="full-width">
               <span>メモ</span>
