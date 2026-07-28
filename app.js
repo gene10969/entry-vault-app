@@ -563,6 +563,63 @@ function switchView(viewId) {
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
+function syncPinInputSecurity() {
+  const input = $('#pinInput');
+  const visible = input.classList.contains('secret-visible');
+  const textMode = input.getAttribute('inputmode') === 'text';
+  input.type = visible || textMode ? 'text' : 'password';
+}
+
+function setPinInputMode(mode, { refocus = false } = {}) {
+  const input = $('#pinInput');
+  const button = $('#pinInputModeButton');
+  const textMode = mode === 'text';
+  input.setAttribute('inputmode', textMode ? 'text' : 'numeric');
+  syncPinInputSecurity();
+  button.textContent = textMode ? '数字入力' : 'かな入力';
+  button.setAttribute('aria-pressed', String(textMode));
+  button.setAttribute('aria-label', textMode ? '数字入力に切り替える' : 'かな入力に切り替える');
+
+  if (refocus) {
+    const cursor = input.selectionStart ?? input.value.length;
+    input.blur();
+    requestAnimationFrame(() => {
+      input.focus();
+      input.setSelectionRange(cursor, cursor);
+    });
+  }
+}
+
+function togglePinInputMode() {
+  const textMode = $('#pinInput').getAttribute('inputmode') === 'text';
+  setPinInputMode(textMode ? 'numeric' : 'text', { refocus: true });
+}
+
+function setPinVisibility(visible) {
+  const input = $('#pinInput');
+  const button = $('#pinVisibilityButton');
+  input.classList.toggle('secret-visible', visible);
+  syncPinInputSecurity();
+  button.textContent = visible ? '隠す' : '表示';
+  button.setAttribute('aria-pressed', String(visible));
+  button.setAttribute('aria-label', visible ? '暗証番号を隠す' : '暗証番号を表示');
+}
+
+function togglePinVisibility() {
+  setPinVisibility(!$('#pinInput').classList.contains('secret-visible'));
+}
+
+function resetPinInputControls() {
+  setPinInputMode('numeric');
+  setPinVisibility(false);
+}
+
+function resetOcrProgress() {
+  $('#ocrProgressWrap').hidden = true;
+  $('#ocrProgressBar').style.width = '0';
+  $('#ocrProgressText').textContent = 'OCR準備中';
+}
+
 async function compressImage(file, maxSide = 1800, quality = 0.86) {
   const dataUrl = await new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -892,13 +949,16 @@ function closeDuplicateDialog() {
   if ($('#duplicateDialog').open) $('#duplicateDialog').close();
 }
 
-function continueDuplicateRegistration() {
+async function continueDuplicateRegistration() {
   const context = state.duplicateContext;
   closeDuplicateDialog();
   state.duplicateContext = null;
   context?.recordIds?.forEach((id) => state.duplicateIgnoredIds.add(id));
-  if (context?.type === 'exact') $('#ocrButton').disabled = !state.imageData;
   showToast('新規登録を続けます');
+  if (context?.type === 'exact' && state.imageData) {
+    $('#ocrButton').disabled = false;
+    await runOcr();
+  }
 }
 
 function cancelDuplicateRegistration() {
@@ -933,6 +993,7 @@ async function handleScreenshot(file) {
   state.duplicateContext = null;
   state.duplicateIgnoredIds.clear();
   $('#ocrButton').disabled = true;
+  resetOcrProgress();
   try {
     const [imageHash, imageData] = await Promise.all([
       file.arrayBuffer().then((bytes) => sha256Hex(bytes)),
@@ -957,6 +1018,7 @@ async function handleScreenshot(file) {
     }
 
     $('#ocrButton').disabled = false;
+    await runOcr();
   } catch (error) {
     console.error(error);
     removeImage();
@@ -976,6 +1038,7 @@ function removeImage() {
   $('#ocrButton').disabled = true;
   $('#ocrDetails').hidden = true;
   $('#ocrRawText').value = '';
+  resetOcrProgress();
 }
 
 function cleanOcrLine(line) {
@@ -1087,7 +1150,13 @@ async function runOcr() {
   const progressWrap = $('#ocrProgressWrap');
   const progressBar = $('#ocrProgressBar');
   const progressText = $('#ocrProgressText');
+  const screenshotInput = $('#screenshotInput');
+  const removeImageButton = $('#removeImageButton');
+  const resetFormButton = $('#resetFormButton');
   setBusy(button, true, '読み取り中…');
+  screenshotInput.disabled = true;
+  removeImageButton.disabled = true;
+  resetFormButton.disabled = true;
   progressWrap.hidden = false;
   progressBar.style.width = '2%';
   progressText.textContent = '画像を最適化しています';
@@ -1162,6 +1231,9 @@ async function runOcr() {
     if (worker) await worker.terminate().catch(() => {});
     setBusy(button, false);
     button.disabled = !state.imageData;
+    screenshotInput.disabled = false;
+    removeImageButton.disabled = false;
+    resetFormButton.disabled = false;
   }
 }
 
@@ -1213,6 +1285,7 @@ function resetForm() {
   state.editingId = '';
   $('#editingId').value = '';
   $('#recordForm').reset();
+  resetPinInputControls();
   $('#formTitle').textContent = '登録内容';
   $('#saveRecordButton').textContent = '暗号化して保存';
   removeImage();
@@ -1227,6 +1300,7 @@ function editRecord(id) {
   $('#buildingInput').value = record.building || '';
   $('#roomInput').value = record.room || '';
   $('#pinInput').value = record.pin || '';
+  resetPinInputControls();
   $('#memoInput').value = record.memo || '';
   state.ocrText = record.ocrText || '';
   $('#ocrRawText').value = state.ocrText;
@@ -1664,6 +1738,8 @@ function bindEvents() {
     renderSearchResults();
     $('#searchInput').focus();
   });
+  $('#pinInputModeButton').addEventListener('click', togglePinInputMode);
+  $('#pinVisibilityButton').addEventListener('click', togglePinVisibility);
 
   $$('.nav-button').forEach((button) => button.addEventListener('click', () => switchView(button.dataset.view)));
   $$('[data-toggle-password]').forEach((button) => {
