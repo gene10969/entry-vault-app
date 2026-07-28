@@ -1,5 +1,5 @@
-const APP_CACHE = 'entry-vault-app-v6';
-const RUNTIME_CACHE = 'entry-vault-runtime-v6';
+const APP_CACHE = 'entry-vault-app-v7';
+const RUNTIME_CACHE = 'entry-vault-runtime-v7';
 const APP_SHELL = [
   './',
   './index.html',

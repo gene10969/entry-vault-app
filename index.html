@@ -267,6 +267,24 @@
     </div>
   </dialog>
 
+  <dialog id="duplicateDialog" class="record-dialog duplicate-dialog" aria-labelledby="duplicateDialogTitle">
+    <div class="dialog-inner">
+      <div class="dialog-header">
+        <div>
+          <p class="section-kicker">DUPLICATE CHECK</p>
+          <h2 id="duplicateDialogTitle">登録済み情報があります</h2>
+        </div>
+        <button id="closeDuplicateDialogButton" class="icon-button" type="button">閉じる</button>
+      </div>
+      <p id="duplicateDialogDescription" class="duplicate-description"></p>
+      <div id="duplicateCandidates" class="duplicate-candidate-list"></div>
+      <div class="duplicate-dialog-actions">
+        <button id="duplicateContinueButton" class="primary-button" type="button">今回は新規登録を続ける</button>
+        <button id="duplicateCancelButton" class="ghost-button" type="button">キャンセル</button>
+      </div>
+    </div>
+  </dialog>
+
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 </body>
 </html>

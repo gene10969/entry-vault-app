@@ -17,9 +17,14 @@ const state = {
   cryptoKey: null,
   records: [],
   imageData: '',
+  imageHash: '',
+  imageContentHash: '',
   ocrText: '',
   editingId: '',
   dialogId: '',
+  duplicateContext: null,
+  duplicateIgnoredIds: new Set(),
+  legacyImageHashCache: new Map(),
   lockTimer: null,
   deferredInstallPrompt: null,
   toastTimer: null,
@@ -77,6 +82,28 @@ function toUint8Array(value) {
 
 function randomBytes(length = 32) {
   return crypto.getRandomValues(new Uint8Array(length));
+}
+
+async function sha256Hex(value) {
+  const bytes = value instanceof ArrayBuffer
+    ? value
+    : value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  return [...digest].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function dataUrlBytes(dataUrl) {
+  const commaIndex = String(dataUrl).indexOf(',');
+  if (commaIndex < 0) throw new Error('Invalid data URL');
+  const metadata = dataUrl.slice(0, commaIndex);
+  const content = dataUrl.slice(commaIndex + 1);
+  return metadata.includes(';base64')
+    ? base64ToBytes(content)
+    : encoder.encode(decodeURIComponent(content));
+}
+
+async function hashDataUrl(dataUrl) {
+  return sha256Hex(dataUrlBytes(dataUrl));
 }
 
 function escapeHtml(value = '') {
@@ -405,6 +432,7 @@ async function loadRecords() {
     }
   }
   state.records = records.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+  state.legacyImageHashCache.clear();
   renderSearchResults();
   updateRecordCount();
   updateStorageSummary();
@@ -501,8 +529,12 @@ function lockApp() {
   state.cryptoKey = null;
   state.records = [];
   state.dialogId = '';
+  state.duplicateContext = null;
+  state.duplicateIgnoredIds.clear();
+  state.legacyImageHashCache.clear();
   clearTimeout(state.lockTimer);
   if ($('#recordDialog').open) $('#recordDialog').close();
+  if ($('#duplicateDialog').open) $('#duplicateDialog').close();
   resetForm();
   $('#appShell').hidden = true;
   $('#authScreen').hidden = false;
@@ -722,27 +754,221 @@ async function prepareDeliveryNameOcrImage(dataUrl) {
   return canvas.toDataURL('image/png');
 }
 
+async function recordImageContentHash(record) {
+  if (record.imageContentHash) return record.imageContentHash;
+  if (!record.imageData) return '';
+
+  const cacheKey = `${record.id}:${record.updatedAt || ''}`;
+  if (state.legacyImageHashCache.has(cacheKey)) {
+    return state.legacyImageHashCache.get(cacheKey);
+  }
+
+  try {
+    const hash = await hashDataUrl(record.imageData);
+    state.legacyImageHashCache.set(cacheKey, hash);
+    return hash;
+  } catch (error) {
+    console.warn('Saved image hash failed', record.id, error);
+    state.legacyImageHashCache.set(cacheKey, '');
+    return '';
+  }
+}
+
+async function findExactImageDuplicates(imageHash, imageContentHash) {
+  const matches = [];
+  for (const record of state.records) {
+    if (record.id === state.editingId) continue;
+
+    const rawHashMatches = Boolean(
+      imageHash &&
+      [record.imageHash, record.imageContentHash].filter(Boolean).includes(imageHash)
+    );
+    const storedContentHash = await recordImageContentHash(record);
+    const contentHashMatches = Boolean(
+      imageContentHash &&
+      [record.imageHash, record.imageContentHash, storedContentHash]
+        .filter(Boolean)
+        .includes(imageContentHash)
+    );
+
+    if (rawHashMatches || contentHashMatches) {
+      matches.push({ record, matchedFields: ['スクリーンショット'] });
+    }
+  }
+  return matches;
+}
+
+function normalizeDuplicateField(value = '') {
+  return normalizeSearch(value)
+    .replace(/(?:さま|様)$/u, '')
+    .replace(/(?:号室|室)$/u, '');
+}
+
+function findSimilarRecordCandidates(fields) {
+  const comparableFields = ['name', 'building', 'room']
+    .filter((field) => normalizeDuplicateField(fields[field]));
+
+  if (!comparableFields.length) return [];
+
+  return state.records
+    .filter((record) => (
+      record.id !== state.editingId &&
+      !state.duplicateIgnoredIds.has(record.id)
+    ))
+    .map((record) => {
+      const matchedFields = comparableFields.filter((field) => {
+        const detected = normalizeDuplicateField(fields[field]);
+        const saved = normalizeDuplicateField(record[field]);
+        return Boolean(detected && saved && detected === saved);
+      });
+      return { record, matchedFields };
+    })
+    .filter(({ matchedFields }) => (
+      comparableFields.length === 1
+        ? matchedFields.length === 1
+        : matchedFields.length >= 2
+    ))
+    .sort((a, b) => (
+      b.matchedFields.length - a.matchedFields.length ||
+      new Date(b.record.updatedAt || 0) - new Date(a.record.updatedAt || 0)
+    ));
+}
+
+function maskedPin(pin = '') {
+  return pin ? '●'.repeat(Math.min(Math.max(pin.length, 4), 10)) : '未設定';
+}
+
+function showDuplicateDialog(candidates, type) {
+  if (!candidates.length) return;
+  const exact = type === 'exact';
+  state.duplicateContext = {
+    type,
+    recordIds: candidates.map(({ record }) => record.id)
+  };
+
+  $('#duplicateDialogTitle').textContent = exact
+    ? 'このスクリーンショットは登録済みです'
+    : '同じ配達先と思われる登録があります';
+  $('#duplicateDialogDescription').textContent = exact
+    ? 'OCRを停止しました。登録済み情報を確認するか、新規登録を続けてください。'
+    : 'OCR結果と、名前・建物名・部屋番号が一致した候補です。';
+
+  $('#duplicateCandidates').innerHTML = candidates.map(({ record, matchedFields }) => {
+    const title = record.name || record.building || record.room || '名称未設定';
+    const location = [record.building, record.room].filter(Boolean).join(' / ') || '建物・部屋番号未設定';
+    const matchLabel = exact
+      ? '画像が完全一致'
+      : `${matchedFields.map((field) => ({
+          name: '名前',
+          building: '建物名',
+          room: '部屋番号'
+        })[field]).join('・')}が一致`;
+
+    return `
+      <article class="duplicate-candidate">
+        <div class="duplicate-candidate-heading">
+          <div>
+            <span class="duplicate-match-label">${escapeHtml(matchLabel)}</span>
+            <h3>${escapeHtml(title)}</h3>
+          </div>
+          <span class="duplicate-updated">更新 ${escapeHtml(formatDate(record.updatedAt))}</span>
+        </div>
+        <dl class="duplicate-summary">
+          <div><dt>建物・部屋</dt><dd>${escapeHtml(location)}</dd></div>
+          <div><dt>暗証番号</dt><dd class="duplicate-pin">${escapeHtml(maskedPin(record.pin))}</dd></div>
+          <div><dt>メモ</dt><dd>${escapeHtml(record.memo || '未設定')}</dd></div>
+        </dl>
+        <div class="duplicate-candidate-actions">
+          <button class="ghost-button" type="button" data-duplicate-action="detail" data-id="${escapeHtml(record.id)}">登録済み情報を開く</button>
+          <button class="secondary-button" type="button" data-duplicate-action="edit" data-id="${escapeHtml(record.id)}">編集する</button>
+        </div>
+      </article>`;
+  }).join('');
+
+  $('#duplicateDialog').showModal();
+}
+
+function closeDuplicateDialog() {
+  if ($('#duplicateDialog').open) $('#duplicateDialog').close();
+}
+
+function continueDuplicateRegistration() {
+  const context = state.duplicateContext;
+  closeDuplicateDialog();
+  state.duplicateContext = null;
+  context?.recordIds?.forEach((id) => state.duplicateIgnoredIds.add(id));
+  if (context?.type === 'exact') $('#ocrButton').disabled = !state.imageData;
+  showToast('新規登録を続けます');
+}
+
+function cancelDuplicateRegistration() {
+  const context = state.duplicateContext;
+  closeDuplicateDialog();
+  state.duplicateContext = null;
+  state.duplicateIgnoredIds.clear();
+  if (context?.type === 'similar') resetForm();
+  else removeImage();
+  showToast('新規登録をキャンセルしました');
+}
+
+function handleDuplicateCandidateAction(action, id) {
+  closeDuplicateDialog();
+  state.duplicateContext = null;
+  state.duplicateIgnoredIds.clear();
+  if (action === 'detail') {
+    resetForm();
+    openRecordDialog(id);
+  }
+  if (action === 'edit') editRecord(id);
+}
+
 async function handleScreenshot(file) {
   if (!file) return;
   if (!file.type.startsWith('image/')) {
     showToast('画像ファイルを選択してください');
     return;
   }
+
+  closeDuplicateDialog();
+  state.duplicateContext = null;
+  state.duplicateIgnoredIds.clear();
+  $('#ocrButton').disabled = true;
   try {
-    state.imageData = await compressImage(file);
+    const [imageHash, imageData] = await Promise.all([
+      file.arrayBuffer().then((bytes) => sha256Hex(bytes)),
+      compressImage(file)
+    ]);
+    const imageContentHash = await hashDataUrl(imageData);
+
+    state.imageHash = imageHash;
+    state.imageContentHash = imageContentHash;
+    state.imageData = imageData;
     $('#imagePreview').src = state.imageData;
     $('#imagePreviewWrap').hidden = false;
-    $('#ocrButton').disabled = false;
     $('#ocrDetails').hidden = true;
+    $('#ocrRawText').value = '';
     state.ocrText = '';
+
+    const exactMatches = await findExactImageDuplicates(imageHash, imageContentHash);
+    if (exactMatches.length) {
+      showDuplicateDialog(exactMatches, 'exact');
+      showToast('登録済みのスクリーンショットを検出しました');
+      return;
+    }
+
+    $('#ocrButton').disabled = false;
   } catch (error) {
     console.error(error);
+    removeImage();
     showToast('画像を読み込めませんでした');
   }
 }
 
 function removeImage() {
   state.imageData = '';
+  state.imageHash = '';
+  state.imageContentHash = '';
+  state.duplicateIgnoredIds.clear();
   state.ocrText = '';
   $('#screenshotInput').value = '';
   $('#imagePreview').removeAttribute('src');
@@ -921,7 +1147,13 @@ async function runOcr() {
     progressText.textContent = '読み取り完了';
 
     const detectedCount = [parsed.name, parsed.building, parsed.room].filter(Boolean).length;
-    showToast(detectedCount ? `${detectedCount}項目を自動入力しました` : '項目を特定できませんでした。OCR全文をご確認ください');
+    const similarCandidates = findSimilarRecordCandidates(parsed);
+    if (similarCandidates.length) {
+      showDuplicateDialog(similarCandidates, 'similar');
+      showToast(`${similarCandidates.length}件の類似登録を検出しました`);
+    } else {
+      showToast(detectedCount ? `${detectedCount}項目を自動入力しました` : '項目を特定できませんでした。OCR全文をご確認ください');
+    }
   } catch (error) {
     console.error(error);
     showToast('OCR処理に失敗しました。手入力をご利用ください');
@@ -945,6 +1177,8 @@ function collectFormRecord() {
     memo: $('#memoInput').value.trim(),
     ocrText: state.ocrText || existing?.ocrText || '',
     imageData: $('#saveImageCheck').checked ? (state.imageData || existing?.imageData || '') : '',
+    imageHash: state.imageHash || existing?.imageHash || '',
+    imageContentHash: state.imageContentHash || existing?.imageContentHash || '',
     createdAt: existing?.createdAt || now,
     updatedAt: now
   };
@@ -998,6 +1232,8 @@ function editRecord(id) {
   $('#ocrRawText').value = state.ocrText;
   $('#ocrDetails').hidden = !state.ocrText;
   state.imageData = record.imageData || '';
+  state.imageHash = record.imageHash || '';
+  state.imageContentHash = record.imageContentHash || '';
   if (state.imageData) {
     $('#imagePreview').src = state.imageData;
     $('#imagePreviewWrap').hidden = false;
@@ -1453,6 +1689,22 @@ function bindEvents() {
   });
   $('#dialogEditButton').addEventListener('click', () => editRecord(state.dialogId));
   $('#dialogDeleteButton').addEventListener('click', () => deleteRecord(state.dialogId));
+
+  $('#duplicateCandidates').addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-duplicate-action]');
+    if (!button) return;
+    handleDuplicateCandidateAction(button.dataset.duplicateAction, button.dataset.id);
+  });
+  $('#duplicateContinueButton').addEventListener('click', continueDuplicateRegistration);
+  $('#duplicateCancelButton').addEventListener('click', cancelDuplicateRegistration);
+  $('#closeDuplicateDialogButton').addEventListener('click', cancelDuplicateRegistration);
+  $('#duplicateDialog').addEventListener('click', (event) => {
+    if (event.target === $('#duplicateDialog')) cancelDuplicateRegistration();
+  });
+  $('#duplicateDialog').addEventListener('cancel', (event) => {
+    event.preventDefault();
+    cancelDuplicateRegistration();
+  });
 
   $('#refreshStorageButton').addEventListener('click', updateStorageSummary);
   $('#biometricSettingsButton').addEventListener('click', toggleBiometricSetting);
